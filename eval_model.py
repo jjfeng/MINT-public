@@ -29,17 +29,32 @@ def parse_args():
 
 
 @torch.no_grad()
+def next_logits(model, idx, age):
+    """Next-event logits at every position of (idx, age), with ignored tokens ruled out."""
+    logits = model(idx, age)[0]
+    logits[..., model.config.ignore_tokens] = -torch.inf
+    return logits
+
+
+def token_probs(logits, tokens):
+    """Model probability that `tokens` is the next event, i.e. softmax over the competing event rates."""
+    return torch.softmax(logits, dim=-1).gather(-1, tokens[..., None])[..., 0]
+
+
+@torch.no_grad()
 def sample_rollout(model, idx, age, n_rollout, gen):
-    """Append n_rollout sampled events to (idx, age) of shape (b, t); returns their tokens and ages, (b, n_rollout)."""
+    """Append n_rollout sampled events to (idx, age) of shape (b, t); returns their tokens, ages and model
+    probabilities, each (b, n_rollout)."""
+    probs = []
     for _ in range(n_rollout):
-        logits = model(idx, age)[0][:, -1]
-        logits[:, model.config.ignore_tokens] = -torch.inf
+        logits = next_logits(model, idx, age)[:, -1]
         # as in Delphi.generate: every token draws an exponential waiting time and the first one to fire is the event
         u = torch.rand(logits.shape, generator=gen, device=logits.device)
         wait, token = (-torch.exp(-logits) * u.log()).min(dim=1)
+        probs.append(token_probs(logits, token))
         idx = torch.cat([idx, token[:, None]], dim=1)
         age = torch.cat([age, age[:, -1:] + wait[:, None]], dim=1)
-    return idx[:, -n_rollout:], age[:, -n_rollout:]
+    return idx[:, -n_rollout:], age[:, -n_rollout:], torch.stack(probs, dim=1)
 
 
 def main():
@@ -59,10 +74,13 @@ def main():
     # padding sits at the start of each row, so every prefix ends at the patient's latest input
     gen = torch.Generator(device=args.device).manual_seed(args.seed)
     rollouts = [sample_rollout(model, X[:, :p + 1], A[:, :p + 1], args.n_rollout, gen) for p in range(X.shape[1])]
-    tokens, ages = [torch.stack(r, dim=1).cpu().numpy() for r in zip(*rollouts)]
+    tokens, ages, probs = [torch.stack(r, dim=1).cpu().numpy() for r in zip(*rollouts)]
     out = xr.Dataset({name: (('batch', 'position'), t.cpu().numpy()) for name, t in zip(FROZEN_VARS, [X, A, Y, B])})
     out['rollout_tokens'] = (('batch', 'position', 'rollout_step'), tokens)
     out['rollout_ages'] = (('batch', 'position', 'rollout_step'), ages)
+    out['rollout_probs'] = (('batch', 'position', 'rollout_step'), probs)
+    # same conditioning as rollout step 0: the history before each target, without targets
+    out['target_probs'] = (('batch', 'position'), token_probs(next_logits(model, X, A), Y).cpu().numpy())
     out['patient'] = ('batch', val_data[val_p2i[val_ix, 0], 0])
     out.to_zarr(args.out_rollouts, mode='w')
     logging.info(f"rollouts {dict(out.sizes)} saved to {args.out_rollouts}")

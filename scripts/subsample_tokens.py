@@ -1,5 +1,6 @@
 """Subsample encounters from a tokenizer feather split and write the (N, 3) uint32
-array [patient_id, t, token_id] consumed by train.py (same layout as tokenizer_v2.save_outputs).
+array [patient_id, t, token_id] consumed by train.py (same layout as tokenizer_v2.save_outputs),
+plus a csv mapping each patient_id back to its encounter_key.
 """
 
 import argparse
@@ -15,6 +16,9 @@ def main():
     parser.add_argument("--n-encounters", type=int, required=True)
     parser.add_argument("--seed", type=int, required=True)
     parser.add_argument("--out-npy", required=True)
+    parser.add_argument(
+        "--out-keys", required=True, help="csv mapping patient_id to encounter_key"
+    )
     args = parser.parse_args()
 
     df = pd.read_feather(args.feather, columns=["encounter_key", "name", "t"])
@@ -38,6 +42,9 @@ def main():
 
     data = df[["patient_id", "t", "token_id"]].to_numpy().astype(np.uint32)
     np.save(args.out_npy, data)
+    df[["patient_id", "encounter_key"]].drop_duplicates().to_csv(
+        args.out_keys, index=False
+    )
     print(f"{args.feather}: kept {args.n_encounters} encounters, {len(data):,} tokens")
 
 

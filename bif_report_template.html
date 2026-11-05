@@ -3,7 +3,7 @@
 <style>
   :root { --surface: #fcfcfb; --text-primary: #0b0b0b; --text-secondary: #52514e; --border: #e6e5e1; }
   body { margin: 0; font: 13px/1.4 system-ui, sans-serif; color: var(--text-primary); background: var(--surface);
-         display: grid; grid-template-columns: 330px 1fr; height: 100vh; }
+         display: grid; grid-template-columns: 140px 1fr; height: 100vh; }
   #sidebar { overflow-y: auto; border-right: 1px solid var(--border); }
   #main { overflow: auto; padding: 16px 20px; }
   h1 { font-size: 15px; margin: 12px; }
@@ -31,10 +31,15 @@
   .event.selected, .event.highlight { background: #cde2fb; font-weight: 600; }
   .patient.match { border: 2px solid #2a78d6; max-height: 80vh; overflow-y: auto; }
   .patient.placeholder { border-style: dashed; }
+  .patient details { margin-bottom: 8px; }
+  .patient details summary { cursor: pointer; color: var(--text-secondary); }
+  .patient .note-text { white-space: pre-wrap; max-height: 40vh; overflow-y: auto; font-size: 11px;
+                        background: #f0efec; padding: 6px; border-radius: 4px; }
   #tabs { display: flex; gap: 4px; margin-bottom: 14px; border-bottom: 1px solid var(--border); }
   #tabs button { font: inherit; border: 0; background: none; padding: 6px 12px; cursor: pointer;
                  color: var(--text-secondary); border-bottom: 2px solid transparent; }
   #tabs button.active { color: var(--text-primary); border-bottom-color: var(--text-primary); }
+  #token-violin text { font-size: 11px; fill: var(--text-secondary); font-variant-numeric: tabular-nums; }
   #violins text { font-size: 11px; fill: var(--text-secondary); font-variant-numeric: tabular-nums; }
   #violins .row:hover .body { fill: #b3b2ad; }
   #tooltip { position: fixed; pointer-events: none; background: #fff; border: 1px solid var(--border);
@@ -43,11 +48,7 @@
 <body>
 <div id="sidebar">
   <h1>Validation patients</h1>
-  <p class="note">BIF = posterior correlation of losses. A patient pair's BIF is its strongest token-pair BIF.
-  z = how far the top training patient sits above
-  that validation patient's influences over all training patients. Click a header to sort.</p>
-  <table><thead><tr><th data-key="patient">patient</th><th data-key="top_bif">top BIF</th>
-  <th data-key="median">median</th><th data-key="z">z</th></tr></thead><tbody id="rows"></tbody></table>
+  <table><thead><tr><th data-key="patient">patient</th></tr></thead><tbody id="rows"></tbody></table>
 </div>
 <div id="main">
   <div id="tabs"><button data-tab="patients" class="active">Patient comparison</button><button data-tab="overview">Overview</button></div>
@@ -62,6 +63,8 @@
 <script>
 const DATA = __DATA__;
 const fmt = x => x.toFixed(3);
+// model probabilities span orders of magnitude
+const fmtProb = x => x >= 0.01 ? x.toFixed(2) : x.toExponential(0);
 
 document.getElementById('legend').innerHTML = Object.entries(DATA.categories)
   .map(([name, color]) => `<span style="--c:${color}">${name}</span>`).join('');
@@ -76,10 +79,56 @@ function card(title, meta, rows, cls) {
   return `<div class="patient ${cls}"><h2>${title}</h2><div class="meta">${meta}</div>${rows.join('')}</div>`;
 }
 
+const escapeHtml = s => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+
+// collapsible clinical note of a patient, shown above its events
+function noteBlock(note) {
+  return `<details><summary>Clinical note</summary><div class="note-text">${escapeHtml(note)}</div></details>`;
+}
+
 // training patient card; the event at target position `highlightPos` (if any) is highlighted
 function trainCard(t, title, meta, highlightPos) {
-  const rows = DATA.train[t].events.map(e => eventRow(e, e[3] === highlightPos ? 'highlight' : '', '', ''));
+  const rows = [noteBlock(DATA.train[t].note)].concat(DATA.train[t].events.map(e => eventRow(e, e[3] === highlightPos ? 'highlight' : '', '', '')));
   return card(title, meta, rows, highlightPos === undefined ? '' : 'match');
+}
+
+const TOKEN_VIOLIN = {width: 270, pad: 12};
+
+// hovering the token violin shows the BIF under the cursor and the percentile it sits at
+function violinHover(svg, d) {
+  const tip = document.getElementById('tooltip'), {width, pad} = TOKEN_VIOLIN;
+  svg.onmousemove = e => {
+    const frac = Math.min(Math.max((e.clientX - svg.getBoundingClientRect().left - pad) / (width - 2 * pad), 0), 1);
+    const k = frac * (d.cdf.length - 1), lo = Math.floor(k), hi = Math.ceil(k);
+    const cdf = d.cdf[lo] + (k - lo) * (d.cdf[hi] - d.cdf[lo]);
+    tip.hidden = false;
+    tip.style.left = `${e.clientX + 12}px`;
+    tip.style.top = `${e.clientY + 12}px`;
+    tip.innerHTML = `BIF ${fmt(d.lo + frac * (d.hi - d.lo))}<br>percentile ${(cdf * 100).toFixed(1)}`;
+  };
+  svg.onmouseleave = () => { tip.hidden = true; };
+}
+
+// violin of the selected token's BIF over all training patient-tokens; ticks = median, dots = the top-K shown
+function distCard(target, step) {
+  const d = target[3].dist, {width, pad} = TOKEN_VIOLIN, height = 104, cy = 46, half = 26;
+  const x = b => pad + (b - d.lo) / (d.hi - d.lo || 1) * (width - 2 * pad);
+  const grid = d.density.map((_, k) => d.lo + k * (d.hi - d.lo) / (d.density.length - 1));
+  const upper = grid.map((b, k) => `${x(b)},${cy - d.density[k] * half}`);
+  const lower = grid.map((b, k) => `${x(b)},${cy + d.density[k] * half}`).reverse();
+  const dots = target[3].top.map((m, r) => `<circle cx="${x(m.influence)}" cy="${cy}" r="4" fill="#2a78d6" stroke="#fcfcfb" stroke-width="1.5"><title>#${r + 1}: ${fmt(m.influence)}</title></circle>`);
+  const quantiles = Object.entries(d.quantiles).map(([q, b]) => `<line x1="${x(b)}" x2="${x(b)}" y1="${cy - half - 4}"
+    y2="${cy + half}" stroke="#52514e" stroke-dasharray="3 2"/><text x="${x(b)}" y="${cy - half - 6}" text-anchor="middle">${Math.round(q * 100)}%</text>`);
+  const svg = `<svg id="token-violin" width="${width}" height="${height}">
+    <polygon points="${upper.concat(lower).join(' ')}" fill="#c9c8c3"/>
+    <line x1="${x(d.median)}" x2="${x(d.median)}" y1="${cy - half}" y2="${cy + half}" stroke="#6b6b66" stroke-width="1.5"/>
+    ${quantiles.join('')}
+    ${dots.join('')}
+    <text x="${pad}" y="${height - 6}">${fmt(d.lo)}</text>
+    <text x="${x(d.median)}" y="${height - 6}" text-anchor="middle">median ${fmt(d.median)}</text>
+    <text x="${width - pad}" y="${height - 6}" text-anchor="end">${fmt(d.hi)}</text></svg>`;
+  return card('BIF distribution', `BIF of ${step === undefined ? '' : 'predicted '}"${target[1]}" over all training
+    patient-tokens (tick = median, dashed = 75th / 90th / 95th percentiles, dots = top tokens shown).`, [svg], '');
 }
 
 // `selected` is the clicked val event; `step` (if any) the clicked event of its rollout, whose matches are then shown
@@ -87,28 +136,30 @@ function show(i, selected, step) {
   const v = DATA.val[i];
   document.querySelectorAll('#rows tr').forEach(tr => tr.classList.toggle('selected', +tr.dataset.i === i));
   const valRows = v.events.map((e, k) => e[3]
-    ? eventRow(e, `clickable${k === selected ? ' selected' : ''}`, `data-k="${k}"`, fmt(e[3][0].influence))
+    ? eventRow(e, `clickable${k === selected ? ' selected' : ''}`, `data-k="${k}"`, `p ${fmtProb(e[5])} · ${fmt(e[3].top[0].influence)}`)
     : eventRow(e, '', '', ''));
   const val = card(`Validation patient ${v.patient}`,
-    'Click an event to see its most influential training tokens (top BIF at right).', valRows, 'val');
+    'Click an event to see its most influential training tokens. At right: p = model probability of the event given the history before it, then its top BIF.', [noteBlock(v.note)].concat(valRows), 'val');
   const target = selected === undefined ? undefined : step === undefined ? v.events[selected] : v.events[selected][4][step];
   const matches = target === undefined
     ? [card('Top influential tokens', 'Click a validation event to show them here.', [], 'match placeholder')]
-    : target[3].map((m, r) => trainCard(m.train, `#${r + 1} token: training patient ${DATA.train[m.train].patient}`,
-        `BIF ${fmt(m.influence)} on ${step === undefined ? '' : 'predicted '}"${target[1]}"`, m.pos));
+    : [distCard(target, step)].concat(target[3].top.map((m, r) => trainCard(m.train,
+        `#${r + 1} token: training patient ${DATA.train[m.train].patient}`,
+        `BIF ${fmt(m.influence)} on ${step === undefined ? '' : 'predicted '}"${target[1]}"`, m.pos)));
   // sampled model rollout from just before the selected event; step 1 is the model's draw for that event
   const hasRolloutBif = selected !== undefined && v.events[selected][4][0][3] !== null;
   const rollout = selected === undefined
     ? card('Model prediction', 'Click a validation event to show it here.', [], 'match placeholder')
-    : card('Model prediction', `Sampled rollout of the trained model from just before "${v.events[selected][1]}".`
+    : card('Model prediction', `Sampled rollout of the trained model from just before "${v.events[selected][1]}" (p = model probability of each drawn event).`
         + (hasRolloutBif ? ' Click a predicted event to see its most influential training tokens.' : ''),
         v.events[selected][4].map((e, s) => e[3]
-          ? eventRow(e, `clickable${s === step ? ' selected' : ''}`, `data-s="${s}"`, `step ${s + 1} · ${fmt(e[3][0].influence)}`)
-          : eventRow(e, '', '', `step ${s + 1}`)), 'match');
+          ? eventRow(e, `clickable${s === step ? ' selected' : ''}`, `data-s="${s}"`, `step ${s + 1} · p ${fmtProb(e[4])} · ${fmt(e[3].top[0].influence)}`)
+          : eventRow(e, '', '', `step ${s + 1} · p ${fmtProb(e[4])}`)), 'match');
   // keep the page where it is; only scroll inside each match card to its highlighted event
   const main = document.getElementById('main'), scrollTop = main.scrollTop;
   document.getElementById('columns').innerHTML = val + rollout + matches.join('');
   main.scrollTop = scrollTop;
+  if (target !== undefined) violinHover(document.getElementById('token-violin'), target[3].dist);
   document.querySelectorAll('.event.clickable[data-k]').forEach(el => el.onclick = () => show(i, +el.dataset.k));
   document.querySelectorAll('.event.clickable[data-s]').forEach(el => el.onclick = () => show(i, selected, +el.dataset.s));
   document.querySelectorAll('.patient.match').forEach(c => {
@@ -170,7 +221,7 @@ function renderRows() {
   renderViolins(order);
   document.getElementById('rows').innerHTML = order.map(i => {
     const v = DATA.val[i];
-    return `<tr data-i="${i}"><td>${v.patient}</td><td>${fmt(v.top_bif)}</td><td>${fmt(v.median)}</td><td>${v.z.toFixed(1)}</td></tr>`;
+    return `<tr data-i="${i}"><td>${v.patient}</td></tr>`;
   }).join('');
   document.querySelectorAll('#rows tr').forEach(tr => tr.onclick = () => show(+tr.dataset.i));
 }

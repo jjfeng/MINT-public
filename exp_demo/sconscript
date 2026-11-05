@@ -24,6 +24,8 @@ def _run_cmd(cmd_parts, n_cpus=2, mem="5G", use_slurm=USE_SLURM):
 
 DATA_DIR = join("#", "MINT raw data", "additional")
 VOCAB = join(DATA_DIR, "vocab.csv")
+VISITS = join("#", "MINT raw data", "visits.csv")
+NOTES_SCRIPT = join("#", "scripts", "assemble_note_text.py")
 CONFIG = join("#", flag, "config_demo.json")
 SUBSAMPLE_SCRIPT = join("#", "scripts", "subsample_tokens.py")
 TRAIN_SCRIPT = join("#", "train.py")
@@ -37,7 +39,7 @@ N_VAL_OBS = 10
 # also compute the BIF of the rolled out events (slow); off = rollouts only
 ROLLOUT_BIF = True
 TRAIN_CODE = [join("#", f) for f in ["model.py", "utils.py"]]
-N_ENCOUNTERS = {"train": 15000, "val": 500}
+N_ENCOUNTERS = {"train": 50000, "val": 500}
 N_SEEDS = 1
 
 nest = SConsWrap(Nest(), localenv["output"], alias_environment=localenv)
@@ -61,9 +63,12 @@ def subsample(env, outdir, c):
             c["seed"],
             "--out-npy",
             "${TARGETS[0]}",
+            "--out-keys",
+            "${TARGETS[1]}",
         ]
         sources = [SUBSAMPLE_SCRIPT, join(DATA_DIR, f"{split}.feather"), VOCAB]
-        commands += env.Command(join(outdir, f"{split}.npy"), sources, _run_cmd(cmd))
+        targets = [join(outdir, f"{split}.npy"), join(outdir, f"{split}_keys.csv")]
+        commands += env.Command(targets, sources, _run_cmd(cmd))
     return commands
 
 
@@ -92,7 +97,7 @@ def train(env, outdir, c):
         TRAIN_SCRIPT,
         CONFIG,
         c["subsample"][0],
-        c["subsample"][1],
+        c["subsample"][2],
         VOCAB,
     ] + TRAIN_CODE
     return env.Command(targets, sources, _run_cmd(cmd))
@@ -121,7 +126,13 @@ def rollout(env, outdir, c):
         "--log",
         "${TARGETS[1]}",
     ]
-    sources = [EVAL_SCRIPT, c["train"][0], c["subsample"][1], VOCAB, BIF_SCRIPT] + TRAIN_CODE
+    sources = [
+        EVAL_SCRIPT,
+        c["train"][0],
+        c["subsample"][2],
+        VOCAB,
+        BIF_SCRIPT,
+    ] + TRAIN_CODE
     return env.Command(targets, sources, _run_cmd(cmd))
 
 
@@ -177,6 +188,26 @@ def bif(env, outdir, c):
 
 
 @nest.add_target_with_env(localenv)
+def notes(env, outdir, c):
+    cmd = [
+        "python",
+        "${SOURCES[0]}",
+        "--bif",
+        "${SOURCES[1]}",
+        "--train-keys",
+        "${SOURCES[2]}",
+        "--val-keys",
+        "${SOURCES[3]}",
+        "--visits",
+        "${SOURCES[4]}",
+        "--out-csv",
+        "${TARGETS[0]}",
+    ]
+    sources = [NOTES_SCRIPT, c["bif"][0], c["subsample"][1], c["subsample"][3], VISITS]
+    return env.Command(join(outdir, "notes.csv"), sources, _run_cmd(cmd, mem="10G"))
+
+
+@nest.add_target_with_env(localenv)
 def plot_bif(env, outdir, c):
     targets = [join(outdir, "bif_report.html")]
     cmd = [
@@ -190,10 +221,12 @@ def plot_bif(env, outdir, c):
         "${SOURCES[3]}",
         "--rollouts",
         "${SOURCES[4]}",
+        "--notes",
+        "${SOURCES[5]}",
         "--top-k",
         3,
         "--out-html",
         "${TARGETS[0]}",
     ]
-    sources = [PLOT_BIF_SCRIPT, c["bif"][0], VOCAB, PLOT_BIF_TEMPLATE, c["rollout"][0]]
+    sources = [PLOT_BIF_SCRIPT, c["bif"][0], VOCAB, PLOT_BIF_TEMPLATE, c["rollout"][0], c["notes"][0]]
     return env.Command(targets, sources, _run_cmd(cmd))

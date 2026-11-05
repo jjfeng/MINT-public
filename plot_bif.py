@@ -10,6 +10,9 @@ import xarray as xr
 from scipy.stats import gaussian_kde
 
 N_GRID = 200
+N_GRID_TOKEN = 60
+# percentiles marked on each token's violin
+VIOLIN_QUANTILES = [0.75, 0.9, 0.95]
 TOKEN_DIMS = ['target_position', 'target_position_T']
 # event category (by vocab prefix) -> categorical color slot; anything unlisted is 'Other'
 CATEGORIES = {'Vital': '#2a78d6', 'Med': '#eb6834', 'CC': '#1baf7a', 'Lab': '#eda100',
@@ -25,6 +28,7 @@ def parse_args():
     parser.add_argument('--vocab', required=True)
     parser.add_argument('--template', required=True, help='HTML template with a __DATA__ placeholder')
     parser.add_argument('--rollouts', required=True, help='zarr directory written by eval_model.py')
+    parser.add_argument('--notes', required=True, help='csv of patient notes written by assemble_note_text.py')
     parser.add_argument('--top-k', type=int, required=True, help='training patient-tokens shown per validation event')
     parser.add_argument('--out-html', required=True)
     return parser.parse_args()
@@ -59,10 +63,21 @@ def events(bif, side, i, vocab_names):
     return head + [event(bif, side, i, p, vocab_names) + [int(p)] for p in positions]
 
 
+def token_density(values):
+    """Violin of one val token's influences over all train patient-tokens, on its own grid, scaled to a peak of 1."""
+    grid = np.linspace(values.min(), values.max(), N_GRID_TOKEN)
+    density = gaussian_kde(values)(grid)
+    return {'lo': float(grid[0]), 'hi': float(grid[-1]), 'median': float(np.median(values)),
+            'quantiles': dict(zip(VIOLIN_QUANTILES, np.quantile(values, VIOLIN_QUANTILES).tolist())),
+            'density': (density / density.max()).round(3).tolist(),
+            # fraction of influences at or below each grid point, for the hover readout
+            'cdf': (np.searchsorted(np.sort(values), grid, side='right') / len(values)).round(4).tolist()}
+
+
 def top_train_tokens(influence_v, top_k):
-    """For each val target position, its top_k most influential train events over all train patients and
-    positions, as a list of {'train': train row, 'pos': train target position, 'influence'}. influence_v has
-    shape (train patients, val position, train position)."""
+    """For each val target position, {'top': its top_k most influential train events over all train patients and
+    positions, as {'train': train row, 'pos': train target position, 'influence'}, 'dist': violin of all its
+    influences}. influence_v has shape (train patients, val position, train position)."""
     n_train, n_val_pos, n_train_pos = influence_v.shape
     flat = influence_v.transpose(1, 0, 2).reshape(n_val_pos, -1)
     matches = {}
@@ -71,8 +86,9 @@ def top_train_tokens(influence_v, top_k):
         best = np.argsort(-flat[p])[:top_k]
         assert np.isfinite(flat[p, best]).all(), f'val position {p} has fewer than {top_k} finite token influences'
         ts, qs = np.unravel_index(best, (n_train, n_train_pos))
-        matches[int(p)] = [{'train': int(t), 'pos': int(q), 'influence': float(flat[p, b])}
-                           for t, q, b in zip(ts, qs, best)]
+        matches[int(p)] = {'top': [{'train': int(t), 'pos': int(q), 'influence': float(flat[p, b])}
+                                   for t, q, b in zip(ts, qs, best)],
+                           'dist': token_density(flat[p][np.isfinite(flat[p])])}
     return matches
 
 
@@ -82,20 +98,23 @@ def violin_densities(influence, grid):
     return densities / densities.max(axis=1, keepdims=True)
 
 
-def with_matches(val_events, matches, rollout):
-    """Attach the top train tokens and the model's rollout to each val event that is a predicted target."""
+def with_matches(val_events, matches, rollout, probs):
+    """Attach the top train tokens, the model's rollout and the model's probability of the event to each val event
+    that is a predicted target."""
     assert all(pos in matches for *_, pos in val_events if pos is not None), 'a real val event has no finite influence'
-    return [e[:3] + ([matches[e[3]], rollout[e[3]]] if e[3] is not None else [None, None]) for e in val_events]
+    return [e[:3] + ([matches[e[3]], rollout[e[3]], float(probs[e[3]])] if e[3] is not None else [None] * 3)
+            for e in val_events]
 
 
 def rollout_events(rollouts, v, vocab_names, matches):
     """Sampled rollout of val patient v from each target position, as lists of [minutes, name, category, top
-    train tokens]; matches are keyed by position * J + step (None when the rollout BIF was not computed)."""
-    tokens, ages = rollouts['rollout_tokens'].values[v], rollouts['rollout_ages'].values[v]
+    train tokens, model probability]; matches are keyed by position * J + step (None when the rollout BIF was not
+    computed)."""
+    tokens, ages, probs = [rollouts[n].values[v] for n in ['rollout_tokens', 'rollout_ages', 'rollout_probs']]
     n_rollout = tokens.shape[1]
     return [[[float(a), vocab_names[t], category(vocab_names[t]),
-              None if matches is None else matches.get(p * n_rollout + s)]
-             for s, (t, a) in enumerate(zip(ts, as_))] for p, (ts, as_) in enumerate(zip(tokens, ages))]
+              None if matches is None else matches.get(p * n_rollout + s), float(q)]
+             for s, (t, a, q) in enumerate(zip(ts, as_, qs))] for p, (ts, as_, qs) in enumerate(zip(tokens, ages, probs))]
 
 
 def rollout_matches(bif, v, top_k):
@@ -108,7 +127,7 @@ def rollout_matches(bif, v, top_k):
     return top_train_tokens(influence.reshape(n_train, n_pos * n_rollout, n_train_pos), top_k)
 
 
-def report_data(tokens, bif, rollouts, vocab_names, top_k):
+def report_data(tokens, bif, rollouts, vocab_names, notes, top_k):
     # patients are ranked by their strongest token-pair influence
     influence = np.nanmax(tokens, axis=(2, 3))
     assert np.isfinite(influence).all(), 'some patient pair has no finite token influence'
@@ -118,12 +137,15 @@ def report_data(tokens, bif, rollouts, vocab_names, top_k):
     z = (top_bif - influence.mean(axis=1)) / influence.std(axis=1)
     grid = np.linspace(influence.min(), influence.max(), N_GRID)
     densities = violin_densities(influence, grid)
-    train = [{'patient': int(bif['patient_1'].values[t]), 'events': events(bif, 1, t, vocab_names)}
+    train = [{'patient': int(bif['patient_1'].values[t]), 'note': notes['train', int(bif['patient_1'].values[t])],
+              'events': events(bif, 1, t, vocab_names)}
              for t in range(influence.shape[1])]
-    val = [{'patient': int(bif['patient_2'].values[v]), 'median': float(median[v]), 'z': float(z[v]),
+    val = [{'patient': int(bif['patient_2'].values[v]), 'note': notes['val', int(bif['patient_2'].values[v])],
+            'median': float(median[v]), 'z': float(z[v]),
             'top_train': int(top_train[v]), 'top_bif': float(top_bif[v]), 'density': densities[v].round(4).tolist(),
             'events': with_matches(events(bif, 2, v, vocab_names), top_train_tokens(tokens[v], top_k),
-                                   rollout_events(rollouts, v, vocab_names, rollout_matches(bif, v, top_k)))}
+                                   rollout_events(rollouts, v, vocab_names, rollout_matches(bif, v, top_k)),
+                                   rollouts['target_probs'].values[v])}
            for v in range(influence.shape[0])]
     return {'categories': CATEGORIES, 'grid': grid.tolist(), 'train': train, 'val': val}
 
@@ -137,7 +159,10 @@ def main():
 
     # the BIF shuffles the val patients, so put the rollouts in its order
     rollouts = xr.open_zarr(args.rollouts).load().swap_dims(batch='patient').sel(patient=bif['patient_2'].values)
-    data = report_data(token_influence(bif), bif, rollouts, vocab_names, args.top_k)
+    notes = pd.read_csv(args.notes).set_index(['split', 'patient_id'])['note_text']
+    # the raw notes mark line breaks with runs of 4+ spaces
+    notes = notes.str.replace(r' {4,}', '\n', regex=True).str.strip().to_dict()
+    data = report_data(token_influence(bif), bif, rollouts, vocab_names, notes, args.top_k)
     with open(args.template) as f:
         template = f.read()
     assert '__DATA__' in template, f'{args.template} has no __DATA__ placeholder'
