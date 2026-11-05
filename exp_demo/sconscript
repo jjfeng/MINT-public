@@ -29,7 +29,13 @@ SUBSAMPLE_SCRIPT = join("#", "scripts", "subsample_tokens.py")
 TRAIN_SCRIPT = join("#", "train.py")
 BIF_SCRIPT = join("#", "train_bayes.py")
 PLOT_BIF_SCRIPT = join("#", "plot_bif.py")
+PLOT_BIF_TEMPLATE = join("#", "bif_report_template.html")
 BIF_CONFIG = join("#", flag, "config_bif.json")
+EVAL_SCRIPT = join("#", "eval_model.py")
+N_ROLLOUT = 5
+N_VAL_OBS = 10
+# also compute the BIF of the rolled out events (slow); off = rollouts only
+ROLLOUT_BIF = True
 TRAIN_CODE = [join("#", f) for f in ["model.py", "utils.py"]]
 N_ENCOUNTERS = {"train": 15000, "val": 500}
 N_SEEDS = 1
@@ -92,6 +98,33 @@ def train(env, outdir, c):
     return env.Command(targets, sources, _run_cmd(cmd))
 
 
+@nest.add_target_with_env(localenv)
+def rollout(env, outdir, c):
+    targets = [join(outdir, "rollouts.zarr"), join(outdir, "rollouts.log")]
+    cmd = [
+        "python",
+        "${SOURCES[0]}",
+        "--ckpt",
+        "${SOURCES[1]}",
+        "--val-npy",
+        "${SOURCES[2]}",
+        "--vocab",
+        "${SOURCES[3]}",
+        "--n-val-obs",
+        N_VAL_OBS,
+        "--n-rollout",
+        N_ROLLOUT,
+        "--seed",
+        c["seed"],
+        "--out-rollouts",
+        "${TARGETS[0]}",
+        "--log",
+        "${TARGETS[1]}",
+    ]
+    sources = [EVAL_SCRIPT, c["train"][0], c["subsample"][1], VOCAB, BIF_SCRIPT] + TRAIN_CODE
+    return env.Command(targets, sources, _run_cmd(cmd))
+
+
 nest.add(
     "correlation_method",
     [
@@ -117,7 +150,7 @@ def bif(env, outdir, c):
         "${SOURCES[2]}",
         "--train-npy",
         "${SOURCES[3]}",
-        "--val-npy",
+        "--rollouts",
         "${SOURCES[4]}",
         "--vocab",
         "${SOURCES[5]}",
@@ -131,13 +164,13 @@ def bif(env, outdir, c):
         "${TARGETS[1]}",
         "--log",
         "${TARGETS[2]}",
-    ]
+    ] + (["--rollout-bif"] if ROLLOUT_BIF else [])
     sources = [
         BIF_SCRIPT,
         BIF_CONFIG,
         c["train"][0],
         c["subsample"][0],
-        c["subsample"][1],
+        c["rollout"][0],
         VOCAB,
     ] + TRAIN_CODE
     return env.Command(targets, sources, _run_cmd(cmd))
@@ -153,10 +186,14 @@ def plot_bif(env, outdir, c):
         "${SOURCES[1]}",
         "--vocab",
         "${SOURCES[2]}",
+        "--template",
+        "${SOURCES[3]}",
+        "--rollouts",
+        "${SOURCES[4]}",
         "--top-k",
         3,
         "--out-html",
         "${TARGETS[0]}",
     ]
-    sources = [PLOT_BIF_SCRIPT, c["bif"][0], VOCAB]
+    sources = [PLOT_BIF_SCRIPT, c["bif"][0], VOCAB, PLOT_BIF_TEMPLATE, c["rollout"][0]]
     return env.Command(targets, sources, _run_cmd(cmd))
