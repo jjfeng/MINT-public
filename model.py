@@ -137,7 +137,16 @@ class AgeEncoding(nn.Module):
         
         #x = self.wae[:x.size(0)]
         return y #self.dropout(x)
-    
+
+
+def ce_pass_mask(targets, ignored_tokens):
+    """True at target positions that count toward the cross-entropy loss (not padding or ignored tokens)."""
+    pass_tokens = targets != -1
+    for k in ignored_tokens:
+        pass_tokens &= targets != k
+    return pass_tokens
+
+
 @dataclass
 class DelphiConfig:
     block_size: int = 1024
@@ -252,10 +261,8 @@ class Delphi(nn.Module):
                 ignored_tokens += [1]
                 logits[...,ignored_tokens] = -torch.inf
             targets = targets.reshape(-1)
-            pass_tokens = targets != -1 
-            for k in ignored_tokens: # and gender
-                pass_tokens *= targets != k
-            
+            pass_tokens = ce_pass_mask(targets, ignored_tokens)
+
             #age_min = age.gather(1,(((idx >=4) * (idx <=12)) + 0).argmax(1)[:,None])
             #logits[...,-1][age <= age_min] = -100. #-float('Inf') ## Death can only occur after age_min
             
@@ -287,6 +294,12 @@ class Delphi(nn.Module):
             return logits, loss, x, att
 
         return logits, loss, att
+
+    def per_token_ce(self, idx, age, targets, targets_age):
+        """Cross-entropy at each target position, shape (b, t); zero where the target is masked."""
+        logits = self(idx, age, targets, targets_age)[0]
+        ce = F.cross_entropy(logits.transpose(1, 2), targets, ignore_index=-1, reduction='none')
+        return ce * ce_pass_mask(targets, self.config.ignore_tokens)
 
     def crop_block_size(self, block_size):
         # model surgery to decrease the block size if necessary

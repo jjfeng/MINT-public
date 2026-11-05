@@ -1,4 +1,5 @@
 """exp_demo: train a small MINT model on a subsample of the pre-tokenized encounters."""
+
 from os.path import join
 
 from nestly import Nest
@@ -14,8 +15,10 @@ USE_SLURM = env["use_slurm"]
 def _run_cmd(cmd_parts, n_cpus=2, mem="5G", use_slurm=USE_SLURM):
     full = " ".join(str(x) for x in cmd_parts)
     if use_slurm:
-        full = (f"srun --nodes=1 --ntasks=1 --cpus-per-task={n_cpus} "
-                f"--mem-per-cpu={mem} --time=72:00:00 {full}")
+        full = (
+            f"srun --nodes=1 --ntasks=1 --cpus-per-task={n_cpus} "
+            f"--mem-per-cpu={mem} --time=72:00:00 {full}"
+        )
     return full
 
 
@@ -24,8 +27,11 @@ VOCAB = join(DATA_DIR, "vocab.csv")
 CONFIG = join("#", flag, "config_demo.json")
 SUBSAMPLE_SCRIPT = join("#", "scripts", "subsample_tokens.py")
 TRAIN_SCRIPT = join("#", "train.py")
+BIF_SCRIPT = join("#", "train_bayes.py")
+PLOT_BIF_SCRIPT = join("#", "plot_bif.py")
+BIF_CONFIG = join("#", flag, "config_bif.json")
 TRAIN_CODE = [join("#", f) for f in ["model.py", "utils.py"]]
-N_ENCOUNTERS = {"train": 5000, "val": 500}
+N_ENCOUNTERS = {"train": 15000, "val": 500}
 N_SEEDS = 1
 
 nest = SConsWrap(Nest(), localenv["output"], alias_environment=localenv)
@@ -37,12 +43,18 @@ def subsample(env, outdir, c):
     commands = []
     for split, n in N_ENCOUNTERS.items():
         cmd = [
-            "python", "${SOURCES[0]}",
-            "--feather",      "${SOURCES[1]}",
-            "--vocab",        "${SOURCES[2]}",
-            "--n-encounters", n,
-            "--seed",         c["seed"],
-            "--out-npy",      "${TARGETS[0]}",
+            "python",
+            "${SOURCES[0]}",
+            "--feather",
+            "${SOURCES[1]}",
+            "--vocab",
+            "${SOURCES[2]}",
+            "--n-encounters",
+            n,
+            "--seed",
+            c["seed"],
+            "--out-npy",
+            "${TARGETS[0]}",
         ]
         sources = [SUBSAMPLE_SCRIPT, join(DATA_DIR, f"{split}.feather"), VOCAB]
         commands += env.Command(join(outdir, f"{split}.npy"), sources, _run_cmd(cmd))
@@ -53,14 +65,98 @@ def subsample(env, outdir, c):
 def train(env, outdir, c):
     targets = [join(outdir, "ckpt.pt"), join(outdir, "train.log")]
     cmd = [
-        "python", "${SOURCES[0]}",
-        "--config",    "${SOURCES[1]}",
-        "--train-npy", "${SOURCES[2]}",
-        "--val-npy",   "${SOURCES[3]}",
-        "--vocab",     "${SOURCES[4]}",
-        "--seed",      c["seed"],
-        "--out-dir",   "${TARGETS[0].dir}",
-        "--log",       "${TARGETS[1]}",
+        "python",
+        "${SOURCES[0]}",
+        "--config",
+        "${SOURCES[1]}",
+        "--train-npy",
+        "${SOURCES[2]}",
+        "--val-npy",
+        "${SOURCES[3]}",
+        "--vocab",
+        "${SOURCES[4]}",
+        "--seed",
+        c["seed"],
+        "--out-dir",
+        "${TARGETS[0].dir}",
+        "--log",
+        "${TARGETS[1]}",
     ]
-    sources = [TRAIN_SCRIPT, CONFIG, c["subsample"][0], c["subsample"][1], VOCAB] + TRAIN_CODE
+    sources = [
+        TRAIN_SCRIPT,
+        CONFIG,
+        c["subsample"][0],
+        c["subsample"][1],
+        VOCAB,
+    ] + TRAIN_CODE
+    return env.Command(targets, sources, _run_cmd(cmd))
+
+
+nest.add(
+    "correlation_method",
+    [
+        "token",
+        # "sequence",
+    ],
+)
+
+
+@nest.add_target_with_env(localenv)
+def bif(env, outdir, c):
+    targets = [
+        join(outdir, "bif.zarr"),
+        join(outdir, "samples.zarr"),
+        join(outdir, "bif.log"),
+    ]
+    cmd = [
+        "python",
+        "${SOURCES[0]}",
+        "--config",
+        "${SOURCES[1]}",
+        "--ckpt",
+        "${SOURCES[2]}",
+        "--train-npy",
+        "${SOURCES[3]}",
+        "--val-npy",
+        "${SOURCES[4]}",
+        "--vocab",
+        "${SOURCES[5]}",
+        "--correlation-method",
+        c["correlation_method"],
+        "--seed",
+        c["seed"],
+        "--out-bif",
+        "${TARGETS[0]}",
+        "--out-samples",
+        "${TARGETS[1]}",
+        "--log",
+        "${TARGETS[2]}",
+    ]
+    sources = [
+        BIF_SCRIPT,
+        BIF_CONFIG,
+        c["train"][0],
+        c["subsample"][0],
+        c["subsample"][1],
+        VOCAB,
+    ] + TRAIN_CODE
+    return env.Command(targets, sources, _run_cmd(cmd))
+
+
+@nest.add_target_with_env(localenv)
+def plot_bif(env, outdir, c):
+    targets = [join(outdir, "bif_report.html")]
+    cmd = [
+        "python",
+        "${SOURCES[0]}",
+        "--bif",
+        "${SOURCES[1]}",
+        "--vocab",
+        "${SOURCES[2]}",
+        "--top-k",
+        3,
+        "--out-html",
+        "${TARGETS[0]}",
+    ]
+    sources = [PLOT_BIF_SCRIPT, c["bif"][0], VOCAB]
     return env.Command(targets, sources, _run_cmd(cmd))

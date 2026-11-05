@@ -1,5 +1,7 @@
 """Subsample encounters from a tokenizer feather split and write the (N, 3) uint32
-array [patient_id, t, token_id] consumed by train.py (same layout as tokenizer_v2.save_outputs)."""
+array [patient_id, t, token_id] consumed by train.py (same layout as tokenizer_v2.save_outputs).
+"""
+
 import argparse
 
 import numpy as np
@@ -16,11 +18,14 @@ def main():
     args = parser.parse_args()
 
     df = pd.read_feather(args.feather, columns=["encounter_key", "name", "t"])
+    print(f"Number of total encounters: {len(df)}")
     vocab = pd.read_csv(args.vocab)
     token_to_id = dict(zip(vocab["name"], vocab["index"]))
 
     encounters = df["encounter_key"].unique()
-    assert args.n_encounters <= len(encounters), f"only {len(encounters)} encounters available"
+    assert args.n_encounters <= len(
+        encounters
+    ), f"only {len(encounters)} encounters available"
     rng = np.random.default_rng(args.seed)
     keep = rng.choice(encounters, size=args.n_encounters, replace=False)
     df = df[df["encounter_key"].isin(keep)].copy()

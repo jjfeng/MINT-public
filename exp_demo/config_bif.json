@@ -1,0 +1,16 @@
+{
+  "device": "cpu",
+  "n_sgld": 1024,
+  "n_train_obs": 128,
+  "n_val_obs": 32,
+  "batch_size": 32,
+  "sgld": {
+    "lr": 0.0001,
+    "n_beta": 30,
+    "localization": 100,
+    "num_chains": 2,
+    "num_draws": 50,
+    "num_burnin_steps": 0,
+    "num_steps_bw_draws": 1
+  }
+}
